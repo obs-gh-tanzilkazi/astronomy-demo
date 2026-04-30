@@ -1,0 +1,17 @@
+# Terraform state — contains sensitive AWS resource details
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
+
+# Terraform variables — contains your IP address
+terraform.tfvars
+
+# Terraform working directory
+.terraform/
+
+# Lock file is safe to commit (reproducible provider versions)
+# .terraform.lock.hcl  ← intentionally NOT ignored
+
+# Helm-generated values dump (may contain tokens if Observe token is in values)
+observe-agent-values.yaml
