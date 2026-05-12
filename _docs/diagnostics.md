@@ -1,172 +1,312 @@
-# EKS Diagnostic Commands
+# Manual Deployment & Diagnostics
 
-Quick reference for troubleshooting `astronomy-demo` in `ap-southeast-2`.
+Manual commands for deploying and tearing down the demo environment without `setup.py`.
+Also includes diagnostic commands and gotchas discovered during operation.
 
 ---
 
-## Setup
+## Manual Deployment (without setup.py)
+
+### 1. Detect public IP and write terraform.tfvars
 
 ```bash
-# Configure kubectl (run this first in any new terminal session)
-aws eks update-kubeconfig --region ap-southeast-2 --name astronomy-demo
+MY_IP=$(curl -s https://checkip.amazonaws.com)
+cat > terraform.tfvars <<EOF
+project_name = "<your-project-name>"
+my_ip_cidr   = "${MY_IP}/32"
+EOF
+```
+
+### 2. Initialise Terraform and select workspace
+
+```bash
+terraform init
+terraform workspace new <project>   # or: terraform workspace select <project>
+```
+
+### 3. Deploy VPC
+
+```bash
+terraform apply -target=module.vpc -auto-approve
+```
+
+### 4. Deploy EKS
+
+```bash
+terraform apply -auto-approve
+```
+
+> Expected duration: ~15–20 minutes.
+
+### 5. Configure kubectl
+
+```bash
+aws eks update-kubeconfig --region ap-southeast-2 --name <project>
+```
+
+### 6. Verify cluster health
+
+```bash
+kubectl get nodes -o wide            # Expect 2x Ready
+kubectl get pods -n kube-system      # Expect vpc-cni, kube-proxy, coredns Running
+```
+
+### 7. Deploy OTel demo app
+
+```bash
+helm upgrade --install <project>-otel-demo open-telemetry/opentelemetry-demo \
+  --version 0.40.7 \
+  --namespace <project> \
+  --create-namespace \
+  -f otel-demo-override.yaml \
+  --timeout 10m \
+  --wait
+```
+
+### 8. Deploy Observe agent
+
+```bash
+# Create namespace
+kubectl create namespace observe
+
+# Create secret
+kubectl -n observe create secret generic agent-credentials \
+  --from-literal=OBSERVE_TOKEN='<your-token>'
+
+# Annotate and label for Helm ownership
+kubectl annotate secret agent-credentials -n observe \
+  meta.helm.sh/release-name=observe-agent \
+  meta.helm.sh/release-namespace=observe
+
+kubectl label secret agent-credentials -n observe \
+  app.kubernetes.io/managed-by=Helm
+
+# Install the chart
+helm install observe-agent observe/agent \
+  --version 0.86.1 \
+  --namespace observe \
+  --set observe.collectionEndpoint.value='<endpoint>' \
+  --set cluster.name='<project>' \
+  --set cluster.deploymentEnvironment.name='<project>' \
+  -f observe-values.yaml \
+  --wait
 ```
 
 ---
 
-## Cluster Health
+## Manual Teardown (without setup.py)
+
+Run in this exact order:
 
 ```bash
-# Nodes — expect all Ready
+# 1. Remove Observe agent
+helm uninstall observe-agent -n observe --wait
+kubectl delete secret agent-credentials -n observe --ignore-not-found
+kubectl delete namespace observe --wait
+
+# 2. Remove OTel demo
+helm uninstall <project>-otel-demo -n <project> --wait
+kubectl delete namespace <project> --wait
+
+# 3. Destroy infrastructure
+terraform destroy -auto-approve
+
+# 4. Clean up CloudWatch logs (avoids ongoing cost)
+aws logs delete-log-group \
+  --log-group-name /aws/eks/<project>/cluster \
+  --region ap-southeast-2
+
+# 5. Remove kubeconfig entry
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+kubectl config delete-cluster arn:aws:eks:ap-southeast-2:${ACCOUNT_ID}:cluster/<project>
+kubectl config delete-context arn:aws:eks:ap-southeast-2:${ACCOUNT_ID}:cluster/<project>
+
+# 6. Delete workspace
+terraform workspace select default
+terraform workspace delete <project>
+```
+
+---
+
+## Gotchas
+
+### Observe chart MUST use namespace `observe`
+
+The chart internally hardcodes ClusterRole/ClusterRoleBinding references to the `observe`
+namespace. Using a custom namespace (e.g. `<project>-observe`) causes:
+```
+namespaces "observe" not found
+```
+**Always use the fixed `observe` namespace.** Isolation is handled by separate EKS clusters.
+
+### Stale ClusterRoles block re-install after failed Helm release
+
+If a `helm install` fails partway through, cluster-scoped resources (ClusterRole,
+ClusterRoleBinding) survive namespace deletion. A subsequent install with a different
+release name fails with:
+```
+annotation "meta.helm.sh/release-name" must equal "X": current value is "Y"
+```
+**Fix:** Find and delete the stale resources:
+```bash
+kubectl get clusterrole,clusterrolebinding -o json | \
+  python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    ann = item.get('metadata', {}).get('annotations', {})
+    if ann.get('meta.helm.sh/release-name') == '<old-release-name>':
+        print(f\"{item['kind']}/{item['metadata']['name']}\")
+"
+# Then delete each one
+```
+
+### Quoted token in secret causes 401
+
+If `config.env` has `OBSERVE_TOKEN="value"` (with quotes), the literal quote characters
+end up in the Kubernetes secret. Observe rejects the token with HTTP 401.
+**Fix:** Never wrap values in quotes in `config.env`. Verify with:
+```bash
+kubectl get secret agent-credentials -n observe -o jsonpath='{.data.OBSERVE_TOKEN}' | base64 -d
+# Should NOT have " at start/end
+```
+
+### Host port conflict — forwarder pods stuck Pending
+
+The OTel demo deploys an `otel-collector-agent` DaemonSet that binds host ports
+4317, 4318, 6831, 14250, 14268, 9411. The Observe forwarder tries the same ports.
+**Fix:** `observe-values.yaml` sets `hostPort: 0` for all forwarder ports. The forwarder
+is still reachable via its ClusterIP service.
+
+### Insufficient CPU — forwarder pods stuck Pending
+
+t3.large nodes have only ~1930m allocatable CPU (not 2000m — kubelet reserves 70m).
+With the demo app running, one node may have only ~180m free. The forwarder's default
+300m request doesn't fit.
+**Fix:** `observe-values.yaml` reduces the CPU request to 150m.
+
+### Terraform destroy fails after main.tf changes
+
+If you modify resource names in `main.tf` (e.g. adding `var.project_name`) after deploying,
+`terraform destroy` will try to rename resources instead of deleting them.
+**Fix:** Either revert `main.tf` to match the deployed state, then destroy; or pass the
+old project name via `-var`:
+```bash
+terraform destroy -var='project_name=<old-name>' -var='my_ip_cidr=0.0.0.0/32'
+```
+
+### Accounting pod OOMKilled
+
+The accounting service (.NET) exceeds its default 120Mi memory limit on startup.
+**Fix:** `otel-demo-override.yaml` bumps it to 300Mi.
+
+### Agent health endpoint is NOT on localhost
+
+The OTel health extension binds to `${MY_POD_IP}`, not `0.0.0.0` or `127.0.0.1`.
+```bash
+# Wrong — will get connection refused:
+kubectl exec <pod> -- wget -qO- localhost:13133/status
+
+# Correct:
+kubectl exec <pod> -- sh -c 'wget -qO- ${MY_POD_IP}:13133/status'
+```
+
+---
+
+## Diagnostic Commands
+
+### Cluster health
+
+```bash
 kubectl get nodes -o wide
-
-# Core system pods — expect vpc-cni, kube-proxy, coredns all Running
 kubectl get pods -n kube-system -o wide
-
-# Recent events (errors, warnings)
 kubectl get events -n kube-system --sort-by='.lastTimestamp' | tail -30
 
-# Installed add-ons and their status
-aws eks list-addons \
-  --cluster-name astronomy-demo \
-  --region ap-southeast-2 \
-  --output table
-
-# Describe a specific add-on
-aws eks describe-addon \
-  --cluster-name astronomy-demo \
-  --addon-name vpc-cni \
-  --region ap-southeast-2 \
-  --query 'addon.{status: status, health: health}' \
-  --output json
-
-# Access entries (who can access the cluster)
-aws eks list-access-entries \
-  --cluster-name astronomy-demo \
-  --region ap-southeast-2 \
-  --output table
+aws eks list-addons --cluster-name <project> --region ap-southeast-2 --output table
+aws eks describe-addon --cluster-name <project> --addon-name vpc-cni --region ap-southeast-2 \
+  --query 'addon.{status: status, health: health}' --output json
 ```
 
----
-
-## Node Group
+### Node group
 
 ```bash
-# List node groups
-aws eks list-nodegroups \
-  --cluster-name astronomy-demo \
-  --region ap-southeast-2 \
-  --output table
-
-# Describe a node group (health, status, instance IDs)
-aws eks describe-nodegroup \
-  --cluster-name astronomy-demo \
-  --nodegroup-name default \
-  --region ap-southeast-2 \
-  --query 'nodegroup.{status: status, health: health}' \
-  --output json
+aws eks list-nodegroups --cluster-name <project> --region ap-southeast-2 --output table
+aws eks describe-nodegroup --cluster-name <project> --nodegroup-name default \
+  --region ap-southeast-2 --query 'nodegroup.{status: status, health: health}' --output json
 ```
 
----
-
-## Node-Level Debugging
+### Node resource pressure
 
 ```bash
-# Check kubelet logs via SSM (no SSH required)
-# Step 1 — install plugin if not present: brew install --cask session-manager-plugin
-# Step 2 — open shell on node
+kubectl get nodes -o custom-columns="NAME:.metadata.name,ALLOC_CPU:.status.allocatable.cpu,ALLOC_MEM:.status.allocatable.memory"
+kubectl describe nodes | grep -A 8 "Allocated resources"
+kubectl top nodes
+kubectl top pods --all-namespaces --sort-by=cpu | head -20
+```
+
+### Node-level debugging (SSM)
+
+```bash
+# Open shell on node (no SSH key required)
 aws ssm start-session --target <instance-id> --region ap-southeast-2
 
-# Step 3 — once inside the node
+# Once inside:
 journalctl -u kubelet -n 100 --no-pager
 journalctl -u containerd -n 50 --no-pager
+```
 
-# EC2 console/bootstrap logs (useful while instance is still starting)
-aws ec2 get-console-output \
-  --instance-id <instance-id> \
-  --region ap-southeast-2 \
-  --output text > /tmp/node-console.txt && tail -50 /tmp/node-console.txt
+### Find EC2 instances
 
-# List running EKS instances (find instance IDs)
-aws ec2 describe-instances \
-  --region ap-southeast-2 \
-  --filters "Name=tag:eks:cluster-name,Values=astronomy-demo" \
-            "Name=instance-state-name,Values=running" \
+```bash
+aws ec2 describe-instances --region ap-southeast-2 \
+  --filters "Name=tag:Project,Values=<project>" "Name=instance-state-name,Values=running" \
   --query 'Reservations[*].Instances[*].{ID: InstanceId, IP: PrivateIpAddress, Launched: LaunchTime}' \
   --output table
 ```
 
----
-
-## CloudWatch Logs
+### Observe agent
 
 ```bash
-# Check log groups exist
-aws logs describe-log-groups \
-  --log-group-name-prefix /aws/eks/astronomy-demo \
-  --region ap-southeast-2 \
-  --query 'logGroups[*].logGroupName' \
-  --output text
-
-# Dump error-level control plane logs to file
-aws logs filter-log-events \
-  --log-group-name /aws/eks/astronomy-demo/cluster \
-  --region ap-southeast-2 \
-  --start-time $(python3 -c "import time; print(int((time.time() - 3600) * 1000))") \
-  --filter-pattern "?Error ?Failed ?Unauthorized ?denied" \
-  --query 'events[*].message' \
-  --output text > /tmp/eks-errors.txt && tail -30 /tmp/eks-errors.txt
-
-# Direct link to CloudWatch in AWS console
-# https://ap-southeast-2.console.aws.amazon.com/cloudwatch/home?region=ap-southeast-2#logsV2:log-groups/log-group/%2Faws%2Feks%2Fastronomy-demo%2Fcluster
-```
-
----
-
-## Cleanup
-
-```bash
-# Terminate orphaned instances from failed node group attempts
-aws ec2 describe-instances \
-  --region ap-southeast-2 \
-  --filters "Name=tag:eks:cluster-name,Values=astronomy-demo" \
-            "Name=instance-state-name,Values=running" \
-  --query 'Reservations[*].Instances[*].InstanceId' \
-  --output text | xargs aws ec2 terminate-instances \
-    --region ap-southeast-2 --instance-ids
-```
-
----
-
-## Quick Smoke Test
-
-```bash
-# Deploy a test pod and verify DNS works inside the cluster
-kubectl run test --image=busybox --restart=Never -- sleep 300
-kubectl exec test -- nslookup kubernetes.default
-kubectl delete pod test
-```
-
----
-
-## Observe Agent
-
-```bash
-# All Observe pods and their status
 kubectl get pods -n observe
-
-# Forwarder DaemonSet — expect Desired == Available (one pod per node)
 kubectl get daemonset observe-agent-forwarder-agent -n observe
-
-# Check why a pod is Pending (look at Events section at the bottom)
 kubectl describe pod -n observe <pod-name>
-
-# Confirm a pod's actual CPU/memory requests (useful after helm upgrade)
 kubectl get pod -n observe <pod-name> -o jsonpath='{.spec.containers[0].resources}'
 
-# Check injected nodeAffinity on a DaemonSet pod
-kubectl get pod -n observe <pod-name> -o jsonpath='{.spec.affinity}' | python3 -m json.tool
+# Health check
+kubectl exec -n observe \
+  $(kubectl get pod -n observe -l app.kubernetes.io/name=node-logs-metrics -o name | head -1) \
+  -- sh -c 'wget -qO- ${MY_POD_IP}:13133/status'
 
-# Find ALL pods with host port claims across the cluster (spot conflicts)
+# Export errors
+kubectl logs -n observe -l app.kubernetes.io/name=node-logs-metrics --tail=100 \
+  | grep -iE "error|fail|401|500|timeout"
+
+# Verify token
+kubectl get secret agent-credentials -n observe -o jsonpath='{.data.OBSERVE_TOKEN}' | base64 -d
+
+# Restart after config change
+kubectl rollout restart daemonset -n observe
+kubectl rollout restart deployment -n observe
+```
+
+### OTel demo app
+
+```bash
+kubectl get pods -n <project>
+helm get values <project>-otel-demo -n <project>
+
+# View rendered collector config
+kubectl get configmap <project>-otel-demo-otelcol -n <project> -o jsonpath='{.data.relay}'
+
+# Collector export errors
+kubectl logs -n <project> -l app.kubernetes.io/name=opentelemetry-collector --tail=100 \
+  | grep -iE "error|fail|refused|timeout"
+```
+
+### Host port conflicts
+
+```bash
+# Find ALL pods claiming host ports across the cluster
 kubectl get pods --all-namespaces -o json | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
@@ -177,97 +317,36 @@ for item in data['items']:
                 print(item['metadata']['namespace'], item['metadata']['name'],
                       item['spec'].get('nodeName','<none>'), c['name'], p['hostPort'])
 "
-
-# Show current Helm values applied to the Observe agent release
-helm get values observe-agent -n observe
-
-# Apply updated observe-values.yaml
-helm upgrade observe-agent observe/agent -n observe -f observe-values.yaml
 ```
 
----
-
-## Observe Agent — Export Health
+### CloudWatch logs
 
 ```bash
-# Check agent health (NOTE: bound to pod IP, not localhost)
-kubectl exec -n observe \
-  $(kubectl get pod -n observe -l app.kubernetes.io/name=node-logs-metrics -o name | head -1) \
-  -- sh -c 'wget -qO- ${MY_POD_IP}:13133/status'
-# Expect: {"status":"Server available","upSince":"...","uptime":"..."}
+aws logs describe-log-groups \
+  --log-group-name-prefix /aws/eks/<project> \
+  --region ap-southeast-2 \
+  --query 'logGroups[*].logGroupName' --output text
 
-# Check for export errors — filter out prometheus scrape noise
-kubectl logs -n observe -l app.kubernetes.io/name=node-logs-metrics --tail=500 \
-  | grep -v "scrape" \
-  | grep -iE "error|fail|500|timeout" | tail -20
-
-kubectl logs -n observe -l app.kubernetes.io/name=cluster-metrics --tail=500 \
-  | grep -v "scrape" \
-  | grep -iE "error|fail|500|timeout" | tail -20
-
-# Check if errors are current (last 5 minutes)
-kubectl logs -n observe -l app.kubernetes.io/name=node-logs-metrics --since=5m \
-  | grep -iE "error|fail|500|timeout"
-
-# Verify TOKEN env var is populated inside the pod
-kubectl exec -n observe \
-  $(kubectl get pod -n observe -l app.kubernetes.io/name=cluster-metrics -o name | head -1) \
-  -- env | grep TOKEN
-
-# Verify secret token value (first 8 chars only — safe to log)
-kubectl get secret agent-credentials -n observe \
-  -o jsonpath='{.data}' | python3 -c "
-import json,sys,base64
-d=json.load(sys.stdin)
-[print(k, '=', base64.b64decode(v).decode()[:8]+'...') for k,v in d.items()]
-"
-
-# Test network connectivity to Observe collection endpoint
-kubectl run curl-test --image=curlimages/curl --restart=Never --rm -it -- \
-  curl -v -o /dev/null https://<tenant>.collect.observeinc.com/ 2>&1 | tail -10
-# Expect: HTTP 401 invalid_token (means network is open, auth expected)
+aws logs filter-log-events \
+  --log-group-name /aws/eks/<project>/cluster \
+  --region ap-southeast-2 \
+  --start-time $(python3 -c "import time; print(int((time.time() - 3600) * 1000))") \
+  --filter-pattern "?Error ?Failed ?Unauthorized ?denied" \
+  --query 'events[*].message' --output text | tail -30
 ```
 
----
-
-## OpenTelemetry Demo App (astronomy-demo)
+### Network connectivity test
 
 ```bash
-# Check all demo app pods
-kubectl get pods -n default
-
-# Current Helm values (null = all defaults)
-helm get values my-otel-demo -n default
-
-# Apply override to add Observe as additional exporter
-helm upgrade my-otel-demo open-telemetry/opentelemetry-demo -n default -f otel-demo-override.yaml
-
-# Watch otel-collector-agent restart after upgrade
-kubectl get pods -n default -l app.kubernetes.io/name=opentelemetry-collector -w
-
-# Check otel-collector-agent logs for export errors
-kubectl logs -n default -l app.kubernetes.io/name=opentelemetry-collector --tail=100 \
-  | grep -iE "error|fail|refused|timeout"
-
-# Port-forward to access the frontend UI
-kubectl port-forward svc/frontend-proxy 8080:8080 -n default &
-# Then open http://localhost:8080
+kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -- \
+  curl -s -o /dev/null -w "%{http_code}" http://observe-agent-forwarder.observe.svc.cluster.local:4317
 ```
 
----
-
-## Node Resource Pressure
+### Cleanup orphaned instances
 
 ```bash
-# Actual allocatable CPU per node (lower than EC2 spec due to kubelet reservation)
-kubectl get nodes -o custom-columns="NAME:.metadata.name,ALLOC_CPU:.status.allocatable.cpu,ALLOC_MEM:.status.allocatable.memory"
-
-# CPU and memory already requested/used on each node
-kubectl describe nodes | grep -A 8 "Allocated resources"
-
-# Top nodes (actual utilisation, requires metrics-server)
-kubectl top nodes
-
-# Top pods sorted by CPU
-kubectl top pods --all-namespaces --sort-by=cpu | head -20
+aws ec2 describe-instances --region ap-southeast-2 \
+  --filters "Name=tag:Project,Values=<project>" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[*].InstanceId' --output text \
+  | xargs aws ec2 terminate-instances --region ap-southeast-2 --instance-ids
 ```

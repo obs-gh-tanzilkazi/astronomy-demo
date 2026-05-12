@@ -1,6 +1,67 @@
 # EKS Deployment Troubleshooting Learnings
 
-_Last updated: 30 April 2026_
+_Last updated: 12 May 2026_
+
+---
+
+### 14. Observe agent 401 Unauthenticated — quoted token in Kubernetes secret
+**Symptom**
+Agent logs show `HTTP Status Code 401` on all export attempts. Data never reaches Observe.
+
+**Cause**
+The `config.env` file had the token wrapped in quotes:
+```
+OBSERVE_TOKEN="ds1eoR...:qJf1A-..."
+```
+The `load_config()` parser did not strip quotes, so `kubectl create secret --from-literal`
+received `"token"` (with literal quote characters). Observe rejected the malformed token.
+
+**Fix**
+Added `.strip("'\"")` to the config parser in `setup.py`. Recreated the secret without quotes
+and restarted the DaemonSets/Deployments in the observe namespace.
+
+---
+
+### 13. Observe Helm chart requires namespace `observe` — cannot be project-prefixed
+**Symptom**
+`helm install` fails with:
+```
+namespaces "observe" not found
+```
+Even though the script created namespace `astronomy-observe`.
+
+**Cause**
+The Observe agent Helm chart internally hardcodes references to the `observe` namespace
+for ClusterRoles, ClusterRoleBindings, and service account lookups. Using a custom namespace
+breaks these references.
+
+**Fix**
+Changed `setup.py` to always use fixed `observe` namespace and `observe-agent` release name.
+Since each project gets its own EKS cluster (full isolation), there is no collision risk.
+
+---
+
+### 12. Stale ClusterRole/ClusterRoleBinding blocks re-install after failed Helm release
+**Symptom**
+After a failed `helm install` with the wrong release name (`astronomy-observe-agent`), a
+subsequent install with the correct name (`observe-agent`) fails:
+```
+ClusterRole "observe-agent-cluster-role-observe" exists and cannot be imported
+annotation "meta.helm.sh/release-name" must equal "observe-agent": current value is "astronomy-observe-agent"
+```
+
+**Cause**
+ClusterRoles and ClusterRoleBindings are cluster-scoped (not namespace-scoped). They survive
+namespace deletion. The failed install left them with ownership annotations pointing to the
+old release name.
+
+**Fix**
+Manually delete the stale cluster-scoped resources:
+```bash
+kubectl get clusterrole,clusterrolebinding -o json | \
+  python3 -c "import json,sys; [print(i['metadata']['name']) for i in json.load(sys.stdin)['items'] if i.get('metadata',{}).get('annotations',{}).get('meta.helm.sh/release-name')=='<old-release>']"
+```
+Then delete each one and retry the install.
 
 ---
 

@@ -17,7 +17,7 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
 
-  name = "demo-vpc"
+  name = "${var.project_name}-vpc"
   cidr = "10.0.0.0/16"
 
   azs             = ["ap-southeast-2a", "ap-southeast-2b"]
@@ -26,13 +26,17 @@ module "vpc" {
 
   enable_nat_gateway = true
   single_nat_gateway = true
+
+  tags = {
+    Project = var.project_name
+  }
 }
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 21.0"
 
-  name               = "astronomy-demo"
+  name               = var.project_name
   kubernetes_version = "1.35"
 
   endpoint_public_access       = true
@@ -75,15 +79,19 @@ module "eks" {
         http_tokens                 = "required"
         http_put_response_hop_limit = 2
       }
+
+      labels = {
+        Project = var.project_name
+      }
     }
+  }
+
+  tags = {
+    Project = var.project_name
   }
 }
 
-
-
 output "configure_kubectl" {
-  value = "aws eks update-kubeconfig --region ap-southeast-2 --name astronomy-demo"
+  value = "aws eks update-kubeconfig --region ap-southeast-2 --name ${var.project_name}"
 }
-
-
 

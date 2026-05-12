@@ -1,6 +1,17 @@
 # opentelemetry-demo override values
 # Adds the Observe forwarder as an additional export destination for
 # traces, metrics, and logs. All existing exporters are preserved.
+#
+# Also bumps the accounting service memory limit — .NET runtime exceeds
+# the chart default of 120Mi and causes OOMKilled (exit 137).
+
+components:
+  accounting:
+    resources:
+      limits:
+        memory: 300Mi
+      requests:
+        memory: 150Mi
 
 opentelemetry-collector:
   config:

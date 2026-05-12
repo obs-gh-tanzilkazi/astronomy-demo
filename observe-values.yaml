@@ -6,6 +6,9 @@
 #         containerPorts and is reachable via its ClusterIP service.
 # Fix 2: forwarder CPU request reduced from default 300m to 150m so it fits on a node
 #         with ~250m free. No CPU limit set so it can still burst freely.
+#
+# Note: cluster.name and cluster.deploymentEnvironment.name are NOT set here —
+#       setup.py passes them dynamically via --set flags using the project name.
 
 agent:
   config:
@@ -18,11 +21,6 @@ application:
     enabled: true
   prometheusScrape:
     enabled: true
-
-cluster:
-  deploymentEnvironment:
-    name: astronomy-demo
-  name: observe-agent-monitored-cluster
 
 node:
   containers:

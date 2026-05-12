@@ -1,277 +1,115 @@
 # Astronomy Demo — Runbook
 
-Full setup and teardown of the `astronomy-demo` EKS cluster, OpenTelemetry demo app,
+Full setup and teardown of an EKS cluster, OpenTelemetry demo app,
 and Observe monitoring agent in AWS `ap-southeast-2`.
-
-**Known-good chart versions** (pinned in all helm commands below):
-
-| Chart | Version | App version |
-|-------|---------|-------------|
-| `observe/agent` | `0.86.1` | `2.15.0` |
-| `open-telemetry/opentelemetry-demo` | `0.40.7` | `2.2.0` |
 
 ---
 
-## Prerequisites
+## Part 1 — Prerequisites
 
 ### Tools required
 
 ```bash
-# Verify all tools are installed
 terraform version        # >= 1.5.0
 aws --version            # >= 2.x
 kubectl version --client
 helm version             # >= 3.x
+python3 --version        # >= 3.8
 ```
 
 Install missing tools:
 ```bash
-brew install terraform awscli kubectl helm
+brew install terraform awscli kubectl helm python3
 ```
 
 ### AWS access
 
 ```bash
-# Option A — IAM user access keys
 aws configure
 # Enter: Access Key ID, Secret Access Key, region: ap-southeast-2, output: json
 
-# Option B — SSO (if Identity Center is configured)
-aws sso login --profile <your-profile>
-
-# Verify access
+# Verify
 aws sts get-caller-identity
 ```
 
 ### Helm chart repositories
 
 ```bash
-helm repo add observe          https://observeinc.github.io/helm-charts
-helm repo add open-telemetry   https://open-telemetry.github.io/opentelemetry-helm-charts
+helm repo add observe https://observeinc.github.io/helm-charts
+helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
 helm repo update
 ```
 
+### config.env (REQUIRED)
+
+This file **must** be created before running `setup.py`:
+
+- Create `config.env` in the project root with the values below
+- AWS keys can be left blank — if empty, the script picks up credentials from environment variables or `~/.aws/credentials`
+
+```
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_DEFAULT_REGION=ap-southeast-2
+OBSERVE_TOKEN=<customerid>:<token>
+OBSERVE_ENDPOINT=https://177179220164.collect.observeinc.com/
+```
+
+> Do NOT wrap values in quotes.
+
 ---
 
-## Project structure
+## Part 2 — Project Structure
 
 ```
 astronomy-demo/
+├── setup.py                   # Main orchestration script
+├── config.env                 # Secrets (gitignored)
 ├── main.tf                    # VPC + EKS infrastructure
-├── variables.tf               # Input variables
-├── terraform.tfvars           # Your IP CIDR — auto-written by deploy.sh
-├── deploy.sh                  # Staged deploy script (infrastructure only)
+├── variables.tf               # Input variables (project_name, my_ip_cidr)
 ├── observe-values.yaml        # Observe agent Helm overrides
-├── otel-demo-override.yaml    # otel-demo Helm overrides (adds Observe exporter)
+├── otel-demo-override.yaml    # OTel demo Helm overrides (adds Observe exporter)
 └── _docs/
     ├── runbook.md             # This file
     ├── learnings.md           # Troubleshooting history
-    └── diagnostics.md         # Quick-reference diagnostic commands
+    └── diagnostics.md         # Manual deploy commands & diagnostics
 ```
 
 ---
 
-## Part 1 — Infrastructure (Terraform)
+## Part 3 — Deploy
 
-### Step 1 — Update your IP
-
-`deploy.sh` detects your public IP automatically and writes it to `terraform.tfvars`
-before each deploy. No manual editing required.
-
-If running Terraform manually (not via `deploy.sh`), update the IP yourself first:
+### Full deploy
 
 ```bash
-echo "my_ip_cidr = \"$(curl -s https://checkip.amazonaws.com)/32\"" > terraform.tfvars
+python3 setup.py --project <name> --deploy
 ```
 
-### Step 2 — Initialise Terraform
+This runs four steps sequentially:
+
+1. **VPC** — creates VPC, subnets, NAT gateway, route tables
+2. **EKS** — creates the EKS cluster and 2x t3.large managed nodes
+3. **OTel Demo** — deploys the OpenTelemetry astronomy demo app (~20 microservices)
+4. **Observe Agent** — creates namespace, secret, installs the Observe agent chart
+
+Each step checks if the resource already exists and skips if so.
+
+### Deploy a single step
 
 ```bash
-terraform init
+python3 setup.py --project <name> --deploy --step vpc
+python3 setup.py --project <name> --deploy --step eks
+python3 setup.py --project <name> --deploy --step otel-demo
+python3 setup.py --project <name> --deploy --step observe
 ```
 
-> Run this every time after a fresh clone or after `terraform destroy`.
-
-### Step 3 — Validate config
+### Check status
 
 ```bash
-terraform validate
-# Expect: "Success! The configuration is valid."
-# One deprecation warning in the VPC module is expected and not a blocker.
+python3 setup.py --project <name> --status
 ```
 
-### Step 4 — Deploy (staged)
-
-Always deploy in two stages. This catches VPC issues before spending 20+ minutes
-waiting for EKS to fail.
-
-```bash
-# Option A — use the deploy script (interactive, recommended)
-bash deploy.sh
-
-# Option B — manual stages
-terraform apply -target=module.vpc
-# Verify in AWS console: VPC, 2 private subnets, 2 public subnets, NAT gateway
-terraform apply
-```
-
-> **Expected duration**: VPC ~2 min, EKS ~15–20 min.
-
-### Step 5 — Configure kubectl
-
-```bash
-aws eks update-kubeconfig --region ap-southeast-2 --name astronomy-demo
-```
-
-### Step 6 — Verify cluster health
-
-```bash
-# Nodes — expect 2x Ready
-kubectl get nodes -o wide
-
-# Core system pods — expect vpc-cni, kube-proxy, coredns all Running
-kubectl get pods -n kube-system
-
-# EKS managed add-ons
-aws eks list-addons --cluster-name astronomy-demo --region ap-southeast-2
-# Expect: vpc-cni, kube-proxy, coredns
-
-# Quick DNS smoke test
-kubectl run smoke-test --image=busybox --restart=Never --rm -it \
-  -- nslookup kubernetes.default
-kubectl delete pod smoke-test --ignore-not-found
-```
-
----
-
-## Part 2 — OpenTelemetry Demo App
-
-### Step 7 — Deploy astronomy-demo
-
-The `otel-demo-override.yaml` is applied here so the app forwards telemetry to
-the Observe agent from the moment it starts.
-
-```bash
-helm upgrade --install my-otel-demo open-telemetry/opentelemetry-demo \
-  --version 0.40.7 \
-  --namespace default \
-  --create-namespace \
-  -f otel-demo-override.yaml \
-  --timeout 10m \
-  --wait
-```
-
-> `--wait` blocks until all pods reach Running/Ready. Expected ~5 min.
-
-### Step 8 — Verify app pods
-
-```bash
-kubectl get pods -n default
-# Expect ~20 pods all Running or Completed
-```
-
-### Step 9 — Access the frontend
-
-```bash
-# Port-forward in the background
-kubectl port-forward svc/frontend-proxy 8080:8080 -n default &
-
-# Open in browser
-open http://localhost:8080
-
-# Stop port-forward when done
-kill %1
-```
-
----
-
-## Part 3 — Observe Monitoring Agent
-
-### Step 10 — Add the Observe Helm repo
-
-```bash
-helm repo add observe https://observeinc.github.io/helm-charts
-helm repo update
-```
-
-### Step 11 — Create the observe namespace and secret
-
-Get your Observe ingest token from the Observe UI:
-- Log into your Observe tenant → **Datastream → Kubernetes** → **Create ingest token**
-- Copy the token (format: `<customerid>:<token>`)
-
-```bash
-kubectl create namespace observe
-
-kubectl -n observe create secret generic agent-credentials \
-  --from-literal=OBSERVE_TOKEN='<your-observe-token>'
-
-kubectl annotate secret agent-credentials -n observe \
-  meta.helm.sh/release-name=observe-agent \
-  meta.helm.sh/release-namespace=observe
-
-kubectl label secret agent-credentials -n observe \
-  app.kubernetes.io/managed-by=Helm
-```
-
-> The annotations and label allow Helm to manage the secret during upgrades.
-> The secret is **not** deleted by `helm uninstall` — delete it manually during teardown.
-
-### Step 12 — Deploy the Observe agent
-
-`observe-values.yaml` contains all required settings from the Observe install guide **plus**
-two compatibility fixes for this cluster (see `_docs/learnings.md` issues 7 and 8):
-
-- **Host port conflict**: the astronomy-demo `otel-collector-agent` DaemonSet already
-  holds ports 4317/4318/6831/14250/14268/9411 on every node — `hostPort` must be `0`.
-- **Insufficient CPU**: t3.large nodes allocate only ~1930m. With the demo running,
-  one node has ~180m free — below the default 300m request. Fixed at 150m.
-
-```bash
-helm upgrade observe-agent observe/agent \
-  --version 0.86.1 \
-  --namespace observe \
-  -f observe-values.yaml \
-  --wait
-```
-
-### Step 13 — Verify all Observe pods are Running
-
-```bash
-kubectl get pods -n observe
-```
-
-Expected:
-```
-observe-agent-cluster-events-*         1/1  Running
-observe-agent-cluster-metrics-*        1/1  Running
-observe-agent-forwarder-agent-<a>      1/1  Running   ← one per node
-observe-agent-forwarder-agent-<b>      1/1  Running   ← one per node
-observe-agent-monitor-*                1/1  Running
-observe-agent-node-logs-metrics-<a>    1/1  Running   ← one per node
-observe-agent-node-logs-metrics-<b>    1/1  Running   ← one per node
-```
-
-If any forwarder pod is still Pending after the upgrade, describe it and check Events:
-```bash
-kubectl describe pod -n observe <pod-name> | tail -20
-```
-
-### Step 14 — Verify agent health
-
-```bash
-kubectl exec -n observe \
-  $(kubectl get pod -n observe -l app.kubernetes.io/name=node-logs-metrics -o name | head -1) \
-  -- sh -c 'wget -qO- ${MY_POD_IP}:13133/status'
-# Expect: {"status":"Server available", ...}
-```
-
-### Step 15 — Verify data in Observe UI
-
-Log into your Observe tenant. Within 5 minutes you should see:
-- **Kubernetes app** → nodes, pods, namespaces, resource metrics
-- **Logs** → container logs from all pods
-- **Traces** → spans from astronomy-demo services (forwarded via `otel-demo-override.yaml`)
+Shows live status of all components, pod health, and node state.
 
 ---
 
@@ -280,149 +118,132 @@ Log into your Observe tenant. Within 5 minutes you should see:
 ### Reconnect after AWS session expiry
 
 ```bash
-aws configure          # re-enter credentials if using access keys
-aws eks update-kubeconfig --region ap-southeast-2 --name astronomy-demo
+aws configure
+aws eks update-kubeconfig --region ap-southeast-2 --name <project>
+```
+
+### Access the frontend
+
+```bash
+kubectl port-forward svc/frontend-proxy 8080:8080 -n <project>
+open http://localhost:8080
 ```
 
 ### Update Observe agent config
 
-Edit `observe-values.yaml`, then:
+Edit `observe-values.yaml`, then redeploy the observe step:
+
 ```bash
-helm upgrade observe-agent observe/agent \
-  --version 0.86.1 \
-  --namespace observe \
-  -f observe-values.yaml \
-  --wait
+python3 setup.py --project <name> --deploy --step observe
 ```
 
-### Update otel-demo config
+### Update OTel demo config
 
-Edit `otel-demo-override.yaml`, then:
-```bash
-helm upgrade my-otel-demo open-telemetry/opentelemetry-demo \
-  --version 0.40.7 \
-  --namespace default \
-  -f otel-demo-override.yaml \
-  --wait
-```
-
-### Port-forward shortcuts
+Edit `otel-demo-override.yaml`, then redeploy:
 
 ```bash
-kubectl port-forward svc/frontend-proxy 8080:8080 -n default &  # App UI
-kubectl port-forward svc/grafana        3000:3000 -n default &  # Grafana
-kubectl port-forward svc/jaeger         16686:16686 -n default & # Jaeger
+python3 setup.py --project <name> --deploy --step otel-demo
 ```
 
 ---
 
-## Part 5 — Full Teardown
+## Part 5 — Teardown
 
-Run strictly in this order. Removing Helm releases before Terraform destroy prevents
-orphaned cloud resources from blocking VPC deletion.
-
-> **Note:** This chart uses `emptyDir` storage only — no PersistentVolumeClaims are
-> created and no EBS volumes need manual cleanup.
-
-### Step 1 — Uninstall Helm releases
+### Full teardown
 
 ```bash
-# Remove Observe agent — wait for all pods to terminate
-helm uninstall observe-agent -n observe --wait
-
-# Delete the secret manually — it is NOT deleted by helm uninstall
-# (it was created with kubectl, not helm)
-kubectl delete secret agent-credentials -n observe --ignore-not-found
-
-# Remove OpenTelemetry demo app — wait for all pods to terminate
-helm uninstall my-otel-demo -n default --wait
-
-# Delete the observe namespace
-kubectl delete namespace observe --wait
-
-# Confirm all pods are gone before proceeding
-kubectl get pods -n default
-kubectl get pods -n observe 2>/dev/null || echo "namespace gone"
+python3 setup.py --project <name> --teardown
 ```
 
-### Step 2 — Check for orphaned EC2 instances
+This runs in reverse order:
+1. Uninstalls Observe agent + deletes secret + deletes `observe` namespace
+2. Uninstalls OTel demo + deletes project namespace
+3. Runs `terraform destroy` (removes EKS + VPC)
+4. Cleans up CloudWatch log group and kubeconfig entries
+5. Deletes the Terraform workspace
 
-EKS sometimes leaves instances running after a failed node group. These will prevent
-a clean VPC destroy if they hold ENIs in the subnets.
-
-```bash
-aws ec2 describe-instances \
-  --region ap-southeast-2 \
-  --filters "Name=tag:eks:cluster-name,Values=astronomy-demo" \
-            "Name=instance-state-name,Values=running" \
-  --query 'Reservations[*].Instances[*].{ID: InstanceId, IP: PrivateIpAddress}' \
-  --output table
-```
-
-If any instances appear that Terraform doesn't know about, terminate them:
-```bash
-aws ec2 describe-instances \
-  --region ap-southeast-2 \
-  --filters "Name=tag:eks:cluster-name,Values=astronomy-demo" \
-            "Name=instance-state-name,Values=running" \
-  --query 'Reservations[*].Instances[*].InstanceId' \
-  --output text | xargs aws ec2 terminate-instances \
-    --region ap-southeast-2 --instance-ids
-```
-
-### Step 3 — Terraform destroy
+### Teardown a single step
 
 ```bash
-terraform destroy
-```
-
-> **Expected duration**: ~10–15 min. EKS cluster deletion is the longest step.
-
-### Step 4 — Clean up CloudWatch log groups (optional — avoids ongoing cost)
-
-EKS control plane logs persist in CloudWatch after the cluster is deleted.
-
-```bash
-aws logs delete-log-group \
-  --log-group-name /aws/eks/astronomy-demo/cluster \
-  --region ap-southeast-2
-```
-
-### Step 5 — Remove local kubeconfig entry
-
-```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-kubectl config delete-cluster \
-  arn:aws:eks:ap-southeast-2:${ACCOUNT_ID}:cluster/astronomy-demo
-kubectl config delete-context \
-  arn:aws:eks:ap-southeast-2:${ACCOUNT_ID}:cluster/astronomy-demo
+python3 setup.py --project <name> --teardown --step observe
+python3 setup.py --project <name> --teardown --step otel-demo
+python3 setup.py --project <name> --teardown --step eks   # destroys all infra
 ```
 
 ---
 
-## Key values reference
+## Part 6 — Common Troubleshooting Commands
 
-| Item | Value |
-|------|-------|
-| AWS region | `ap-southeast-2` |
-| Cluster name | `astronomy-demo` |
-| Kubernetes version | `1.35` |
-| Node type | `t3.large` (2 nodes) |
-| Node allocatable CPU | `1930m` per node (not 2000m — kubelet reserves 70m) |
-| VPC CIDR | `10.0.0.0/16` |
-| Private subnets | `10.0.1.0/24`, `10.0.2.0/24` |
-| Observe tenant | `177179220164` |
-| Observe endpoint | `https://177179220164.collect.observeinc.com/` |
-| Observe namespace | `observe` |
-| Observe Helm release | `observe-agent` |
-| Demo app Helm release | `my-otel-demo` |
-| Observe forwarder service | `observe-agent-forwarder.observe.svc.cluster.local:4317` |
-| otel-demo chart version | `0.40.7` |
-| observe/agent chart version | `0.86.1` |
+### Cluster health
+
+| Command | When to use |
+|---------|-------------|
+| `kubectl get nodes -o wide` | Check if nodes are Ready and see instance IPs |
+| `kubectl get pods -A` | Overview of all pods across all namespaces |
+| `kubectl get pods -n kube-system` | Verify core components (vpc-cni, coredns, kube-proxy) |
+| `kubectl top nodes` | Check CPU/memory pressure on nodes |
+| `kubectl top pods -n <ns>` | Find resource-hungry pods |
+
+### Pod issues
+
+| Command | When to use |
+|---------|-------------|
+| `kubectl describe pod <pod> -n <ns>` | Pod stuck Pending or CrashLooping — shows Events |
+| `kubectl logs <pod> -n <ns> --tail=50` | Read recent container logs |
+| `kubectl logs <pod> -n <ns> --previous` | Read logs from the last crash (OOMKilled, etc.) |
+| `kubectl get events -n <ns> --sort-by=.lastTimestamp` | Recent events sorted by time |
+| `kubectl delete pod <pod> -n <ns>` | Force restart a pod (controller recreates it) |
+
+### Observe agent
+
+| Command | When to use |
+|---------|-------------|
+| `kubectl get pods -n observe` | Check all Observe pods are Running |
+| `kubectl logs -n observe -l app.kubernetes.io/name=node-logs-metrics --tail=50` | Check for export errors (401, 500, timeout) |
+| `kubectl logs -n observe -l app.kubernetes.io/name=forwarder --tail=50` | Check forwarder receiving app telemetry |
+| `kubectl get secret agent-credentials -n observe -o jsonpath='{.data.OBSERVE_TOKEN}' \| base64 -d` | Verify the token stored in the secret |
+| `kubectl exec -n observe <pod> -- sh -c 'wget -qO- ${MY_POD_IP}:13133/status'` | Health check (expect "Server available") |
+| `kubectl rollout restart daemonset -n observe` | Restart all DaemonSet pods after config change |
+| `kubectl rollout restart deployment -n observe` | Restart all Deployment pods after config change |
+
+### OTel demo app
+
+| Command | When to use |
+|---------|-------------|
+| `kubectl get pods -n <project>` | Check demo app pods status |
+| `kubectl get configmap <project>-otel-demo-otelcol -n <project> -o jsonpath='{.data.relay}'` | View the OTel collector config |
+| `kubectl logs -n <project> -l app.kubernetes.io/component=otel-collector --tail=50` | Check collector for export errors |
+| `helm get values <project>-otel-demo -n <project>` | View effective Helm values |
+
+### Helm
+
+| Command | When to use |
+|---------|-------------|
+| `helm list -A` | Show all installed releases |
+| `helm status <release> -n <ns>` | Check release status and last deploy time |
+| `helm history <release> -n <ns>` | View revision history (for rollback decisions) |
+| `helm rollback <release> <revision> -n <ns>` | Roll back to a previous revision |
+
+### Terraform / AWS
+
+| Command | When to use |
+|---------|-------------|
+| `terraform workspace list` | See all project workspaces |
+| `terraform state list` | Check what resources Terraform knows about |
+| `aws eks describe-cluster --name <project> --region ap-southeast-2` | Verify EKS cluster exists and its status |
+| `aws ec2 describe-instances --region ap-southeast-2 --filters "Name=tag:Project,Values=<project>"` | Find EC2 instances for a project |
+
+### Network / connectivity
+
+| Command | When to use |
+|---------|-------------|
+| `kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -- curl -s <url>` | Test connectivity from inside the cluster |
+| `kubectl get svc -n <ns>` | View service ClusterIPs and ports |
+| `kubectl get svc -A --field-selector spec.type=NodePort` | Find externally exposed services |
 
 ---
 
-## Troubleshooting quick links
+## Troubleshooting resources
 
 - Known issues and root causes: `_docs/learnings.md`
 - Diagnostic command reference: `_docs/diagnostics.md`

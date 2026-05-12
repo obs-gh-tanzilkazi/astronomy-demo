@@ -4,7 +4,10 @@ terraform.tfstate.backup
 *.tfstate
 *.tfstate.*
 
-# Terraform variables — contains your IP address
+# Terraform workspace state directories
+terraform.tfstate.d/
+
+# Terraform variables — contains your IP address (auto-written by setup.py)
 terraform.tfvars
 
 # Terraform working directory
@@ -15,3 +18,6 @@ terraform.tfvars
 
 # Helm-generated values dump (may contain tokens if Observe token is in values)
 observe-agent-values.yaml
+
+# Secrets and environment config — DO NOT COMMIT
+config.env
