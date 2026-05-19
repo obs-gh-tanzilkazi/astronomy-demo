@@ -229,19 +229,13 @@ def step_otel_demo(project, state):
         state["otel_demo"] = "SKIPPED"
         return
 
-    # Build a project-specific override: replace the hardcoded forwarder endpoint
-    observe_ns    = "observe"
-    forwarder_svc = f"observe-agent-forwarder.{observe_ns}.svc.cluster.local"
+    # Build a project-specific override
     base_override = (SCRIPT_DIR / "otel-demo-override.yaml").read_text()
-    dynamic_override = base_override.replace(
-        "observe-agent-forwarder.observe.svc.cluster.local:4317",
-        f"{forwarder_svc}:4317",
-    )
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".yaml", prefix=f"{project}-otel-override-", delete=False
     ) as tmp:
-        tmp.write(dynamic_override)
+        tmp.write(base_override)
         tmp_path = tmp.name
 
     try:
@@ -275,9 +269,7 @@ def step_observe(project, state):
     print(f"\n── [4/4] Observe Agent  (release={release}, ns={namespace}) ─────────")
 
     observe_token    = require_env("OBSERVE_TOKEN", "Observe agent deploy")
-    observe_endpoint = os.environ.get(
-        "OBSERVE_ENDPOINT", "https://177179220164.collect.observeinc.com/"
-    )
+    observe_endpoint = require_env("OBSERVE_ENDPOINT", "Observe agent deploy")
 
     if helm_release_exists(release, namespace):
         print(f"  SKIP — Helm release '{release}' already deployed")
@@ -305,13 +297,13 @@ def step_observe(project, state):
 
     print(f"  Deploying {OBSERVE_CHART} {OBSERVE_CHART_VERSION} ...")
     run(
-        f"helm install {release} {OBSERVE_CHART} "
+        f"helm upgrade --install {release} {OBSERVE_CHART} "
         f"--version {OBSERVE_CHART_VERSION} "
         f"--namespace {namespace} "
         f"--set observe.collectionEndpoint.value='{observe_endpoint}' "
         f"--set cluster.name='{project}' "
         f"--set cluster.deploymentEnvironment.name='{project}' "
-        f"-f {SCRIPT_DIR}/observe-values.yaml "
+        f"-f '{SCRIPT_DIR}/observe-values.yaml' "
         f"--wait"
     )
     state["observe"] = "DEPLOYED"
@@ -526,6 +518,43 @@ def show_status(project):
     print()
 
 
+# ── Preflight checks ──────────────────────────────────────────────────────────
+REQUIRED_TOOLS = {
+    "terraform": "brew tap hashicorp/tap && brew install hashicorp/tap/terraform",
+    "aws":       "brew install awscli",
+    "kubectl":   "brew install kubectl",
+    "helm":      "brew install helm",
+    "curl":      "brew install curl",
+}
+
+HELM_REPOS = {
+    "observe":        "https://observeinc.github.io/helm-charts",
+    "open-telemetry": "https://open-telemetry.github.io/opentelemetry-helm-charts",
+}
+
+
+def check_prerequisites():
+    """Verify all required CLI tools are on PATH."""
+    import shutil
+    missing = []
+    for tool, install_hint in REQUIRED_TOOLS.items():
+        if not shutil.which(tool):
+            missing.append((tool, install_hint))
+    if missing:
+        print("ERROR: Missing required tools:\n")
+        for tool, hint in missing:
+            print(f"  • {tool:12s} → install with: {hint}")
+        print()
+        sys.exit(1)
+
+
+def ensure_helm_repos():
+    """Ensure required Helm chart repositories are added."""
+    for name, url in HELM_REPOS.items():
+        run(f"helm repo add --force-update {name} {url}", check=False, capture=True)
+    run("helm repo update", check=False, capture=True)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -548,6 +577,8 @@ def main():
     args = parser.parse_args()
 
     load_config()
+    check_prerequisites()
+    ensure_helm_repos()
 
     project = args.project
     print(f"\n{'='*66}")

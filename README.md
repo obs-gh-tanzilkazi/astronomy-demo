@@ -19,7 +19,8 @@ python3 --version        # >= 3.8
 
 Install missing tools:
 ```bash
-brew install terraform awscli kubectl helm python3
+brew tap hashicorp/tap && brew install hashicorp/tap/terraform
+brew install awscli kubectl helm python3
 ```
 
 ### AWS access
@@ -52,7 +53,7 @@ AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 AWS_DEFAULT_REGION=ap-southeast-2
 OBSERVE_TOKEN=<customerid>:<token>
-OBSERVE_ENDPOINT=https://177179220164.collect.observeinc.com/
+OBSERVE_ENDPOINT=https://<your-customer-id>.collect.observeinc.com/
 ```
 
 > Do NOT wrap values in quotes.
@@ -64,7 +65,7 @@ OBSERVE_ENDPOINT=https://177179220164.collect.observeinc.com/
 - **Multi-project support** via `--project` + Terraform workspaces — you can run multiple isolated instances side by side
 - **Idempotent** — each step checks if resources already exist before deploying (skips VPC if in state, skips EKS if cluster exists, skips Helm releases if already deployed)
 - **Wait loops with timeouts** for NAT gateway, node readiness, and pod readiness
-- **Dynamic namespacing** — the OTel override YAML is templated at runtime to point at the correct Observe forwarder service per-project, so multiple demo environments can run simultaneously
+- **Dynamic namespacing** — each project gets its own namespace; multiple demo environments can run simultaneously on the same cluster
 - **Three modes**: `--deploy`, `--teardown`, `--status`
 - **Granular step control** via `--step` for rerunning individual stages
 - **Clean teardown** — reverse-order removal including CloudWatch log group cleanup and kubeconfig entry removal

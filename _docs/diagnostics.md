@@ -82,7 +82,7 @@ kubectl label secret agent-credentials -n observe \
   app.kubernetes.io/managed-by=Helm
 
 # Install the chart
-helm install observe-agent observe/agent \
+helm upgrade --install observe-agent observe/agent \
   --version 0.86.1 \
   --namespace observe \
   --set observe.collectionEndpoint.value='<endpoint>' \

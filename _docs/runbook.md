@@ -19,7 +19,8 @@ python3 --version        # >= 3.8
 
 Install missing tools:
 ```bash
-brew install terraform awscli kubectl helm python3
+brew tap hashicorp/tap && brew install hashicorp/tap/terraform
+brew install awscli kubectl helm python3
 ```
 
 ### AWS access
@@ -52,7 +53,7 @@ AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 AWS_DEFAULT_REGION=ap-southeast-2
 OBSERVE_TOKEN=<customerid>:<token>
-OBSERVE_ENDPOINT=https://177179220164.collect.observeinc.com/
+OBSERVE_ENDPOINT=https://<your-customer-id>.collect.observeinc.com/
 ```
 
 > Do NOT wrap values in quotes.
