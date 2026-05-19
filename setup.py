@@ -22,7 +22,7 @@ from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR        = Path(__file__).parent.resolve()
-REGION            = "ap-southeast-2"
+REGION            = None  # set from config.env in main()
 OTEL_DEMO_CHART   = "open-telemetry/opentelemetry-demo"
 OTEL_DEMO_VERSION = "0.40.7"
 OBSERVE_CHART         = "observe/agent"
@@ -103,8 +103,9 @@ def write_tfvars(project, ip):
     tfvars.write_text(
         f'project_name = "{project}"\n'
         f'my_ip_cidr   = "{ip}/32"\n'
+        f'region       = "{REGION}"\n'
     )
-    print(f"  terraform.tfvars written  (project={project}, my_ip_cidr={ip}/32)")
+    print(f"  terraform.tfvars written  (project={project}, region={REGION}, my_ip_cidr={ip}/32)")
 
 
 # ── Wait loops ─────────────────────────────────────────────────────────────────
@@ -577,6 +578,10 @@ def main():
     args = parser.parse_args()
 
     load_config()
+
+    global REGION
+    REGION = require_env("AWS_DEFAULT_REGION", "region selection")
+
     check_prerequisites()
     ensure_helm_repos()
 

@@ -10,7 +10,11 @@ terraform {
 }
 
 provider "aws" {
-  region = "ap-southeast-2"
+  region = var.region
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
 module "vpc" {
@@ -20,7 +24,7 @@ module "vpc" {
   name = "${var.project_name}-vpc"
   cidr = "10.0.0.0/16"
 
-  azs             = ["ap-southeast-2a", "ap-southeast-2b"]
+  azs             = slice(data.aws_availability_zones.available.names, 0, 2)
   private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
   public_subnets  = ["10.0.101.0/24", "10.0.102.0/24"]
 
@@ -92,6 +96,6 @@ module "eks" {
 }
 
 output "configure_kubectl" {
-  value = "aws eks update-kubeconfig --region ap-southeast-2 --name ${var.project_name}"
+  value = "aws eks update-kubeconfig --region ${var.region} --name ${var.project_name}"
 }
 
