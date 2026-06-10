@@ -3,6 +3,7 @@ terraform.tfstate
 terraform.tfstate.backup
 *.tfstate
 *.tfstate.*
+*.pdf
 
 # Terraform workspace state directories
 terraform.tfstate.d/
@@ -21,3 +22,5 @@ observe-agent-values.yaml
 
 # Secrets and environment config — DO NOT COMMIT
 config.env
+_docs/.DS_Store
+.DS_Store
