@@ -146,6 +146,21 @@ Edit `otel-demo-override.yaml`, then redeploy:
 python3 setup.py --project <name> --deploy --step otel-demo
 ```
 
+### Snapshot the live OTel collector config
+
+Dumps the running collector ConfigMap into `otel_config_full.yaml` for reference:
+
+```bash
+kubectl get configmap otel-collector-agent -n astronomy \
+  -o jsonpath='{.data.relay}' > otel_config_full.yaml
+```
+
+Commit the snapshot after capturing it:
+
+```bash
+git add otel_config_full.yaml && git commit -m "chore: update otel collector config snapshot"
+```
+
 ---
 
 ## Part 5 — Teardown
